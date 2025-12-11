@@ -3,6 +3,7 @@
 #include <esp_now.h>
 
 // MAC is: AC:67:B2:53:86:28
+// Another Mac: 24:0A:C4:1D:29:A0
 
 /* ======================== Configuration ======================== */
 
