@@ -242,10 +242,14 @@ void loop() {
       // Periodic feedback display
       static uint32_t tLastFbPrint = 0;
       if (now - tLastFbPrint > 1000) {
-          // batVoltage from firmware is batVoltageCalib (calibrated voltage in volts)
+          // batVoltage from firmware is x100 (4169 = 41.69V)
           // boardTemp is already in degrees Celsius
           Serial.print("[FB] V:");
-          Serial.print(fb.batVoltage * 0.1f, 1);  // Display with 1 decimal place
+          int16_t volts_int = fb.batVoltage / 100;
+          int16_t volts_dec = (fb.batVoltage % 100) / 10;
+          Serial.print(volts_int);
+          Serial.print(".");
+          Serial.print(volts_dec);
           Serial.print("V L:");
           Serial.print(fb.speedL_meas);
           Serial.print(" R:");
