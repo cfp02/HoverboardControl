@@ -73,6 +73,12 @@ namespace HB {
     port().write(reinterpret_cast<const uint8_t*>(&c), sizeof(c));
   }
 
+  void sendSpeedSteerUnits(int16_t speedUnits, int16_t steerUnits) {
+    SerialCommand c{START_FRAME, steerUnits, speedUnits};
+    c.checksum = cs(c);
+    port().write(reinterpret_cast<const uint8_t*>(&c), sizeof(c));
+  }
+
   bool readFeedback(SerialFeedback& data) {
     auto& p = port();
     static uint8_t idx = 0;
@@ -262,12 +268,13 @@ void loop() {
   }
 
   bool active = (now - tLastJoy) < COMMAND_TIMEOUT_MS;
-  float spd = active ? lastJoy.speed_pct : 0.0f;
-  float str = active ? lastJoy.steer_pct : 0.0f;
+  // Controller sends values directly in -1000 to 1000 range
+  int16_t spd = active ? lastJoy.speed_pct : 0;
+  int16_t str = active ? lastJoy.steer_pct : 0;
 
   static uint32_t tLastSend = 0;
   if (now - tLastSend >= SEND_PERIOD_MS) {
-    HB::sendSpeedSteerPct(spd, str);
+    HB::sendSpeedSteerUnits(spd, str);
     tLastSend = now;
   }
   
