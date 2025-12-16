@@ -27,6 +27,19 @@ struct SerialCommand {
   int16_t  speed;
   uint16_t checksum;
 };
+
+// Incoming Feedback structure from Hoverboard
+struct SerialFeedback {
+  uint16_t start;
+  int16_t  cmd1;
+  int16_t  cmd2;
+  int16_t  speedR_meas;
+  int16_t  speedL_meas;
+  int16_t  batVoltage;
+  int16_t  boardTemp;
+  uint16_t cmdLed;
+  uint16_t checksum;
+};
 #pragma pack(pop)
 
 namespace HB {
@@ -40,6 +53,12 @@ namespace HB {
     return static_cast<uint16_t>(c.start ^ c.steer ^ c.speed);
   }
 
+  // Checksum calculation for received data
+  inline uint16_t csRecv(const SerialFeedback& f) {
+    return static_cast<uint16_t>(f.start ^ f.cmd1 ^ f.cmd2 ^ f.speedR_meas ^ f.speedL_meas
+                            ^ f.batVoltage ^ f.boardTemp ^ f.cmdLed);
+  }
+
   inline int16_t pctToUnits(float pct) {
     pct = fminf(fmaxf(pct, -100.0f), 100.0f);
     return static_cast<int16_t>(lroundf(pct * (VOLT_FULL_UNITS / 100.0f)));
@@ -49,6 +68,31 @@ namespace HB {
     SerialCommand c{START_FRAME, pctToUnits(steerPct), pctToUnits(speedPct)};
     c.checksum = cs(c);
     port().write(reinterpret_cast<const uint8_t*>(&c), sizeof(c));
+  }
+
+  // Check for incoming data
+  bool readFeedback(SerialFeedback& data) {
+    auto& p = port();
+    if (p.available() < sizeof(SerialFeedback)) return false;
+
+    // Basic sync: peek first byte, if not 0xABCD low byte (0xCD or 0xAB depending on endianness), skip
+    // Simplify: Just read if size is there.
+    // Note: 0xABCD is sent as Low Byte (0xCD) then High Byte (0xAB) usually.
+    
+    // Minimal implementation:
+    if (p.peek() != 0xAB && p.peek() != 0xCD) {
+        p.read(); // Discard misalignment
+        return false;
+    }
+
+    SerialFeedback temp;
+    p.readBytes((uint8_t*)&temp, sizeof(temp));
+    
+    if (temp.start == START_FRAME && temp.checksum == csRecv(temp)) {
+        data = temp;
+        return true;
+    }
+    return false;
   }
 }
 
@@ -60,6 +104,12 @@ struct JoystickPacket {
   int16_t steer_pct;  // left/right
   uint8_t flags;
   uint8_t seq;
+  uint16_t crc;
+};
+
+// Packet to send back to controller
+struct FeedbackPacket {
+  SerialFeedback hb;
   uint16_t crc;
 };
 #pragma pack(pop)
@@ -78,6 +128,10 @@ static JoystickPacket lastJoy{};
 static uint32_t tLastJoy = 0;
 static bool peerAdded = false;
 
+// Store controller address for reply
+static uint8_t controllerMac[6];
+static bool controllerKnown = false;
+
 // Receive callback
 void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
   if (len != sizeof(JoystickPacket)) return;
@@ -88,12 +142,17 @@ void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
   uint16_t crcCalc = crc16_ccitt((uint8_t*)&p, sizeof(p) - sizeof(p.crc));
   if (crcCalc != p.crc) return;
 
-  if (!peerAdded) {
-    esp_now_peer_info_t peer{};
-    memcpy(peer.peer_addr, mac, 6);
-    peer.channel = 0;
-    peer.encrypt = false;
-    if (esp_now_add_peer(&peer) == ESP_OK) peerAdded = true;
+  // Capture sender MAC and register as peer if needed
+  if (!controllerKnown || memcmp(controllerMac, mac, 6) != 0) {
+      memcpy(controllerMac, mac, 6);
+      controllerKnown = true;
+      if (!esp_now_is_peer_exist(mac)) {
+          esp_now_peer_info_t peer{};
+          memcpy(peer.peer_addr, mac, 6);
+          peer.channel = 0;
+          peer.encrypt = false;
+          esp_now_add_peer(&peer);
+      }
   }
 
   lastJoy = p;
@@ -116,6 +175,15 @@ void setup() {
 
 void loop() {
   const uint32_t now = millis();
+
+  // Check and forward feedback
+  SerialFeedback fb;
+  if (HB::readFeedback(fb) && controllerKnown) {
+      FeedbackPacket pkt;
+      pkt.hb = fb;
+      pkt.crc = crc16_ccitt((uint8_t*)&pkt.hb, sizeof(pkt.hb));
+      esp_now_send(controllerMac, (uint8_t*)&pkt, sizeof(pkt));
+  }
 
   // Check link timeout
   bool active = (now - tLastJoy) < COMMAND_TIMEOUT_MS;
