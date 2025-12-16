@@ -8,8 +8,8 @@
 /* ======================== Configuration ======================== */
 
 // Hoverboard UART
-static constexpr int      TX_HOVER   = TX;
-static constexpr int      RX_HOVER   = RX;
+static constexpr int      TX_HOVER   = 16; // TX;
+static constexpr int      RX_HOVER   = 17; //RX;
 static constexpr uint32_t HOVER_BAUD = 115200;
 
 // Command protocol
@@ -43,9 +43,11 @@ struct SerialFeedback {
 #pragma pack(pop)
 
 namespace HB {
-  HardwareSerial& port() { static HardwareSerial h(0); return h; }
+  // CHANGED: Use Serial2 for Hoverboard (leaves Serial0 free for USB debug)
+  HardwareSerial& port() { static HardwareSerial h(2); return h; }
 
   void begin() {
+    // Start the Hoverboard connection on the new pins
     port().begin(HOVER_BAUD, SERIAL_8N1, RX_HOVER, TX_HOVER);
   }
 
@@ -53,7 +55,6 @@ namespace HB {
     return static_cast<uint16_t>(c.start ^ c.steer ^ c.speed);
   }
 
-  // Checksum calculation for received data
   inline uint16_t csRecv(const SerialFeedback& f) {
     return static_cast<uint16_t>(f.start ^ f.cmd1 ^ f.cmd2 ^ f.speedR_meas ^ f.speedL_meas
                             ^ f.batVoltage ^ f.boardTemp ^ f.cmdLed);
@@ -70,18 +71,25 @@ namespace HB {
     port().write(reinterpret_cast<const uint8_t*>(&c), sizeof(c));
   }
 
-  // Check for incoming data
   bool readFeedback(SerialFeedback& data) {
     auto& p = port();
+    
+    // DEBUG: Check if we are receiving ANY bytes at all
+    if (p.available() > 0 && p.available() < sizeof(SerialFeedback)) {
+       // Optional: Uncomment to see if bytes are trickling in
+       // Serial.print("."); 
+    }
+
     if (p.available() < sizeof(SerialFeedback)) return false;
 
-    // Basic sync: peek first byte, if not 0xABCD low byte (0xCD or 0xAB depending on endianness), skip
-    // Simplify: Just read if size is there.
-    // Note: 0xABCD is sent as Low Byte (0xCD) then High Byte (0xAB) usually.
-    
-    // Minimal implementation:
+    // Peek for sync byte (Low byte of 0xABCD is 0xCD or 0xAB depending on sender endianness)
+    // Firmware sends: (uint16_t)start = 0xABCD. 
+    // Usually sent as 0xCD then 0xAB (Little Endian).
     if (p.peek() != 0xAB && p.peek() != 0xCD) {
-        p.read(); // Discard misalignment
+        // DEBUG: Found garbage byte
+        byte trash = p.read();
+        Serial.print("[Trash] 0x");
+        Serial.println(trash, HEX);
         return false;
     }
 
@@ -90,7 +98,20 @@ namespace HB {
     
     if (temp.start == START_FRAME && temp.checksum == csRecv(temp)) {
         data = temp;
+        // DEBUG: SUCCESS!
+        Serial.print("RX Valid! Volts: ");
+        Serial.print(temp.batVoltage);
+        Serial.print(" | L: ");
+        Serial.print(temp.speedL_meas);
+        Serial.print(" | R: ");
+        Serial.println(temp.speedR_meas);
         return true;
+    } else {
+        // DEBUG: Checksum Failed
+        Serial.print("CRC FAIL! Exp: ");
+        Serial.print(csRecv(temp));
+        Serial.print(" Got: ");
+        Serial.println(temp.checksum);
     }
     return false;
   }
@@ -127,25 +148,22 @@ static uint16_t crc16_ccitt(const uint8_t *data, size_t len, uint16_t crc = 0xFF
 static JoystickPacket lastJoy{};
 static uint32_t tLastJoy = 0;
 static bool peerAdded = false;
-
-// Store controller address for reply
 static uint8_t controllerMac[6];
 static bool controllerKnown = false;
 
-// Receive callback
 void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
   if (len != sizeof(JoystickPacket)) return;
-
   JoystickPacket p;
   memcpy(&p, data, sizeof(p));
-
   uint16_t crcCalc = crc16_ccitt((uint8_t*)&p, sizeof(p) - sizeof(p.crc));
   if (crcCalc != p.crc) return;
 
-  // Capture sender MAC and register as peer if needed
   if (!controllerKnown || memcmp(controllerMac, mac, 6) != 0) {
       memcpy(controllerMac, mac, 6);
       controllerKnown = true;
+      Serial.print("New Controller Found: ");
+      Serial.printf("%02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+      
       if (!esp_now_is_peer_exist(mac)) {
           esp_now_peer_info_t peer{};
           memcpy(peer.peer_addr, mac, 6);
@@ -154,29 +172,38 @@ void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
           esp_now_add_peer(&peer);
       }
   }
-
   lastJoy = p;
   tLastJoy = millis();
 }
 
 bool setupEspNow() {
-  WiFi.mode(WIFI_STA); // Station mode only, no AP
-  if (esp_now_init() != ESP_OK) return false;
+  WiFi.mode(WIFI_STA); 
+  if (esp_now_init() != ESP_OK) {
+      Serial.println("ESPNow Init Failed");
+      return false;
+  }
   esp_now_register_recv_cb(onEspNowRecv);
+  Serial.println("ESPNow Ready");
   return true;
 }
 
 /* ======================== Main Loop ======================== */
 
 void setup() {
+  // Start USB Debugging
+  Serial.begin(115200);
+  Serial.println("Booting...");
+
+  // Start Hoverboard on Serial2
   HB::begin();
+  
   setupEspNow();
 }
 
 void loop() {
   const uint32_t now = millis();
 
-  // Check and forward feedback
+  // Check Feedback
   SerialFeedback fb;
   if (HB::readFeedback(fb) && controllerKnown) {
       FeedbackPacket pkt;
@@ -185,7 +212,6 @@ void loop() {
       esp_now_send(controllerMac, (uint8_t*)&pkt, sizeof(pkt));
   }
 
-  // Check link timeout
   bool active = (now - tLastJoy) < COMMAND_TIMEOUT_MS;
   float spd = active ? lastJoy.speed_pct : 0.0f;
   float str = active ? lastJoy.steer_pct : 0.0f;
@@ -194,5 +220,12 @@ void loop() {
   if (now - tLastSend >= SEND_PERIOD_MS) {
     HB::sendSpeedSteerPct(spd, str);
     tLastSend = now;
+  }
+  
+  // Debug output if no packet received for a while?
+  static uint32_t tLastDebug = 0;
+  if (now - tLastDebug > 2000) {
+      if (!controllerKnown) Serial.println("Waiting for Controller...");
+      tLastDebug = now;
   }
 }
