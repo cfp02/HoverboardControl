@@ -35,6 +35,8 @@ struct SerialFeedback {
   int16_t  cmd2;
   int16_t  speedR_meas;
   int16_t  speedL_meas;
+  int16_t  wheelR_cnt;
+  int16_t  wheelL_cnt;
   int16_t  batVoltage;
   int16_t  boardTemp;
   uint16_t cmdLed;
@@ -57,7 +59,7 @@ namespace HB {
 
   inline uint16_t csRecv(const SerialFeedback& f) {
     return static_cast<uint16_t>(f.start ^ f.cmd1 ^ f.cmd2 ^ f.speedR_meas ^ f.speedL_meas
-                            ^ f.batVoltage ^ f.boardTemp ^ f.cmdLed);
+                            ^ f.wheelR_cnt ^ f.wheelL_cnt ^ f.batVoltage ^ f.boardTemp ^ f.cmdLed);
   }
 
   inline int16_t pctToUnits(float pct) {
@@ -73,46 +75,59 @@ namespace HB {
 
   bool readFeedback(SerialFeedback& data) {
     auto& p = port();
+    static uint8_t idx = 0;
+    static uint16_t startWin = 0;
+    static uint8_t* bufPtr = nullptr;
+    static SerialFeedback fbNew;
+    static bool synced = false;
     
-    // DEBUG: Check if we are receiving ANY bytes at all
-    if (p.available() > 0 && p.available() < sizeof(SerialFeedback)) {
-       // Optional: Uncomment to see if bytes are trickling in
-       // Serial.print("."); 
+    while (p.available()) {
+      uint8_t b = p.read();
+      startWin = (uint16_t)((startWin << 8) | b);
+      
+      // Look for start frame (0xABCD or 0xCDAB)
+      if (idx == 0) {
+        if (startWin == START_FRAME || startWin == 0xCDAB) {
+          if (!synced) {
+            Serial.println("[FB] Synced to hoverboard");
+            synced = true;
+          }
+          bufPtr = (uint8_t*)&fbNew;
+          if (startWin == START_FRAME) {
+            *bufPtr++ = (uint8_t)(START_FRAME & 0xFF);
+            *bufPtr++ = (uint8_t)((START_FRAME >> 8) & 0xFF);
+          } else {
+            *bufPtr++ = 0xCD;
+            *bufPtr++ = 0xAB;
+          }
+          idx = 2;
+        }
+        continue;
+      }
+      
+      // Collect bytes after start frame
+      if (idx >= 2 && idx < sizeof(SerialFeedback)) {
+        *bufPtr++ = b;
+        idx++;
+        
+        // Complete packet received
+        if (idx == sizeof(SerialFeedback)) {
+          uint16_t cs = csRecv(fbNew);
+          if (fbNew.start == START_FRAME && cs == fbNew.checksum) {
+            data = fbNew;
+            idx = 0;
+            startWin = 0;
+            return true;
+          } else {
+            // Checksum failed - reset and continue
+            idx = 0;
+            startWin = 0;
+            continue;
+          }
+        }
+      }
     }
-
-    if (p.available() < sizeof(SerialFeedback)) return false;
-
-    // Peek for sync byte (Low byte of 0xABCD is 0xCD or 0xAB depending on sender endianness)
-    // Firmware sends: (uint16_t)start = 0xABCD. 
-    // Usually sent as 0xCD then 0xAB (Little Endian).
-    if (p.peek() != 0xAB && p.peek() != 0xCD) {
-        // DEBUG: Found garbage byte
-        byte trash = p.read();
-        Serial.print("[Trash] 0x");
-        Serial.println(trash, HEX);
-        return false;
-    }
-
-    SerialFeedback temp;
-    p.readBytes((uint8_t*)&temp, sizeof(temp));
     
-    if (temp.start == START_FRAME && temp.checksum == csRecv(temp)) {
-        data = temp;
-        // DEBUG: SUCCESS!
-        Serial.print("RX Valid! Volts: ");
-        Serial.print(temp.batVoltage);
-        Serial.print(" | L: ");
-        Serial.print(temp.speedL_meas);
-        Serial.print(" | R: ");
-        Serial.println(temp.speedR_meas);
-        return true;
-    } else {
-        // DEBUG: Checksum Failed
-        Serial.print("CRC FAIL! Exp: ");
-        Serial.print(csRecv(temp));
-        Serial.print(" Got: ");
-        Serial.println(temp.checksum);
-    }
     return false;
   }
 }
@@ -192,12 +207,25 @@ bool setupEspNow() {
 void setup() {
   // Start USB Debugging
   Serial.begin(115200);
-  Serial.println("Booting...");
+  
+  // Wait for serial monitor to be ready (ESP32 specific)
+  delay(1000);
+  while (!Serial && millis() < 5000) {
+    delay(10);
+  }
+  
+  Serial.println();
+  Serial.println("=== Booting ===");
+  Serial.flush();
 
   // Start Hoverboard on Serial2
   HB::begin();
+  Serial.println("Hoverboard Serial2 initialized");
+  Serial.flush();
   
   setupEspNow();
+  Serial.println("Setup complete");
+  Serial.flush();
 }
 
 void loop() {
@@ -210,6 +238,23 @@ void loop() {
       pkt.hb = fb;
       pkt.crc = crc16_ccitt((uint8_t*)&pkt.hb, sizeof(pkt.hb));
       esp_now_send(controllerMac, (uint8_t*)&pkt, sizeof(pkt));
+      
+      // Periodic feedback display
+      static uint32_t tLastFbPrint = 0;
+      if (now - tLastFbPrint > 1000) {
+          // batVoltage from firmware is batVoltageCalib (calibrated voltage in volts)
+          // boardTemp is already in degrees Celsius
+          Serial.print("[FB] V:");
+          Serial.print(fb.batVoltage * 0.1f, 1);  // Display with 1 decimal place
+          Serial.print("V L:");
+          Serial.print(fb.speedL_meas);
+          Serial.print(" R:");
+          Serial.print(fb.speedR_meas);
+          Serial.print(" T:");
+          Serial.print(fb.boardTemp);
+          Serial.println("C");
+          tLastFbPrint = now;
+      }
   }
 
   bool active = (now - tLastJoy) < COMMAND_TIMEOUT_MS;
@@ -222,10 +267,12 @@ void loop() {
     tLastSend = now;
   }
   
-  // Debug output if no packet received for a while?
+  // Status update
   static uint32_t tLastDebug = 0;
-  if (now - tLastDebug > 2000) {
-      if (!controllerKnown) Serial.println("Waiting for Controller...");
+  if (now - tLastDebug > 5000) {
+      if (!controllerKnown) {
+          Serial.println("[Status] Waiting for controller...");
+      }
       tLastDebug = now;
   }
 }
